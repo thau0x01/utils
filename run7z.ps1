@@ -3,13 +3,16 @@
   Descriptografa/decodifica um .7z em memória e executa o arquivo interno passando argumentos.
 
 .DESCRIPTION
-  - Requer 7z.exe (7-Zip) no PATH.
+  - Requer 7z.exe (7-Zip) no PATH (ou informe -SevenZipPath).
   - Lê o conteúdo para memória via "7z e -so".
   - Executa .ps1 em memória.
-  - Executa .exe/.bat/.cmd gravando em TEMP com ACL restrita e removendo o arquivo logo após iniciar o processo (no NTFS, fica sem nome enquanto roda).
+  - Executa .exe/.bat/.cmd gravando em TEMP com ACL restrita e removendo o arquivo logo após iniciar o processo.
 
 .PARAMETER Archive
   Caminho do arquivo .7z
+
+.PARAMETER SevenZipPath
+  Caminho completo para o 7z.exe/7za.exe (opcional). Se não informado, tenta localizar no PATH e locais comuns.
 
 .PARAMETER Password
   Senha do .7z, se houver (opcional)
@@ -25,12 +28,6 @@
 
 .PARAMETER NoWait
   (Opcional) Se definido, não espera o término do processo interno. O código de saída do wrapper será 0.
-
-.EXAMPLE
-  .\Run-7zExec.ps1 -Archive .\app.7z -- --help
-
-.EXAMPLE
-  .\Run-7zExec.ps1 -Archive .\secure.7z -Password '123' -Sha256 'ABCDEF...' -HideWindow
 #>
 
 [CmdletBinding()]
@@ -39,19 +36,18 @@ param(
   [string]$Archive,
 
   [Parameter(Mandatory=$false)]
+  [string]$SevenZipPath,   # <= NOVO (opção A/B)
+
+  [Parameter(Mandatory=$false)]
   [string]$Password,
 
   [Parameter(Mandatory=$false)]
   [string]$Entry,
 
-  # NEW: integridade opcional
   [Parameter(Mandatory=$false)]
   [string]$Sha256,
 
-  # NEW: janela oculta
   [switch]$HideWindow,
-
-  # NEW: não esperar o término
   [switch]$NoWait,
 
   # tudo após "--" vira argumento pro programa interno
@@ -62,12 +58,23 @@ param(
 # -- utilidades ---------------------------------------------------------------
 
 function Find-SevenZip {
-  $candidates = @('7z.exe','7za.exe')
-  foreach ($c in $candidates) {
-    $cmd = Get-Command $c -ErrorAction SilentlyContinue
-    if ($cmd) { return $cmd.Path }
+  param([string]$OverridePath)
+
+  if ($OverridePath) {
+    if (Test-Path -LiteralPath $OverridePath) { return $OverridePath }
+    throw "7z.exe especificado não existe: $OverridePath"
   }
-  throw "7z.exe não encontrado. Instale o 7-Zip e garanta que '7z.exe' está no PATH."
+
+  $cmd = Get-Command 7z.exe, 7za.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($cmd) { return $cmd.Path }
+
+  $candidatos = @(
+    "$env:ProgramFiles\7-Zip\7z.exe",
+    "$env:ProgramFiles(x86)\7-Zip\7z.exe"
+  )
+  foreach ($p in $candidatos) { if (Test-Path -LiteralPath $p) { return $p } }
+
+  throw "7z.exe não encontrado. Use -SevenZipPath ou adicione o 7-Zip ao PATH."
 }
 
 function Invoke-7z {
@@ -99,7 +106,7 @@ function Invoke-7z {
 function List-7zEntries {
   param(
     [string]$SevenZipPath,
-    [string]$ArchivePath,
+    [string]$ArchivePath,  # **usar caminho absoluto**
     [string]$Password
   )
   $args = @('l','-slt','-ba')
@@ -119,7 +126,7 @@ function List-7zEntries {
   $out = $p.StandardOutput.ReadToEnd()
   $err = $p.StandardError.ReadToEnd()
   $p.WaitForExit()
-  if ($p.ExitCode -ne 0) { throw "Falha ao listar 7z: $err" }
+  if ($p.ExitCode -ne 0) { throw "Falha ao listar 7z:`n$err" }
 
   $entries = @()
   $current = @{}
@@ -160,34 +167,24 @@ function Is-Ps1 {
   return ($head -like '#!*powershell*' -or $head -like '#!*pwsh*')
 }
 
-# NEW: detecção de PE/EXE (MZ + PE\0\0)
 function Is-WindowsExe {
   param([string]$Name,[byte[]]$Bytes)
   if ($Name.ToLower().EndsWith('.exe')) { return $true }
   if ($Bytes.Length -lt 0x40) { return $false }
   if ($Bytes[0] -ne 0x4D -or $Bytes[1] -ne 0x5A) { return $false } # 'MZ'
-  # PE header offset em 0x3C (DWORD little endian)
   $off = [BitConverter]::ToInt32($Bytes,0x3C)
   if ($off -lt 0 -or ($off + 4) -gt $Bytes.Length) { return $false }
-  return ($Bytes[$off] -eq 0x50 -and $Bytes[$off+1] -eq 0x45 -and $Bytes[$off+2] -eq 0x00 -and $Bytes[$off+3] -eq 0x00)
+  return ($Bytes[$off] -eq 0x50 -and $Bytes[$off+1] -eq 0x45 -and $Bytes[$off+2] -eq 0x00 -and $Bytes[$off+3] -eq 0x00) # 'PE\0\0'
 }
 
-function Get-TextFromBytes {
-  param([byte[]]$Bytes)
-  try { return [System.Text.Encoding]::UTF8.GetString($Bytes) }
-  catch { return [System.Text.Encoding]::Default.GetString($Bytes) }
-}
+function Get-TextFromBytes { param([byte[]]$Bytes) try { [System.Text.Encoding]::UTF8.GetString($Bytes) } catch { [System.Text.Encoding]::Default.GetString($Bytes) } }
 
-# NEW: SHA-256 helper
 function Get-Sha256Hex {
   param([byte[]]$Bytes)
   $sha = [System.Security.Cryptography.SHA256]::Create()
-  try {
-    ($sha.ComputeHash($Bytes) | ForEach-Object { $_.ToString("x2") }) -join ''
-  } finally { $sha.Dispose() }
+  try { ($sha.ComputeHash($Bytes) | ForEach-Object { $_.ToString("x2") }) -join '' } finally { $sha.Dispose() }
 }
 
-# NEW: aplica ACL restrita (somente usuário atual)
 function Set-StrictAcl {
   param([string]$Path)
   $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
@@ -200,7 +197,7 @@ function Set-StrictAcl {
     [System.Security.AccessControl.AccessControlType]::Allow
   )
   $acl.SetOwner($user)
-  $acl.SetAccessRuleProtection($true,$false) # desabilita herança
+  $acl.SetAccessRuleProtection($true,$false)
   $null = $acl.AddAccessRule($rule)
   Set-Acl -LiteralPath $Path -AclObject $acl
 }
@@ -208,32 +205,38 @@ function Set-StrictAcl {
 # -- fluxo principal ----------------------------------------------------------
 
 try {
-  if (-not (Test-Path -LiteralPath $Archive)) { throw "Arquivo não encontrado: $Archive" }
+  # Opção C: resolver o caminho do .7z para ABSOLUTO
+  $ArchiveFull = $null
+  try {
+    $ArchiveFull = (Resolve-Path -LiteralPath $Archive).Path
+  } catch {
+    throw "Arquivo não encontrado: $Archive"
+  }
 
-  $SevenZip = Find-SevenZip
+  $SevenZip = Find-SevenZip -OverridePath $SevenZipPath
 
   if (-not $Entry) {
-    $entries = List-7zEntries -SevenZipPath $SevenZip -ArchivePath $Archive -Password $Password
+    $entries = List-7zEntries -SevenZipPath $SevenZip -ArchivePath $ArchiveFull -Password $Password
     $Entry = Choose-Entry -Entries $entries
   }
 
   Write-Verbose "Usando 7z: $SevenZip"
+  Write-Verbose "Arquivo: $ArchiveFull"
   Write-Verbose "Entrada escolhida: $Entry"
 
-  # extrai um único item para stdout
+  # extrai um único item para stdout (usa caminho ABSOLUTO)
   $args7 = @('e','-y','-so')
   if ($Password) { $args7 += "-p$Password" }
-  $args7 += @("""$Archive""","""$Entry""")
+  $args7 += @("""$ArchiveFull""","""$Entry""")
 
   $res = Invoke-7z -SevenZipPath $SevenZip -Arguments $args7
   if ($res.ExitCode -ne 0 -or -not $res.Bytes -or $res.Bytes.Length -eq 0) {
     if ($res.StdErr) { Write-Error $res.StdErr }
-    throw "Falha ao extrair a entrada '$Entry' do arquivo '$Archive'. Código: $($res.ExitCode)"
+    throw "Falha ao extrair a entrada '$Entry' do arquivo '$ArchiveFull'. Código: $($res.ExitCode)"
   }
 
   $blob = $res.Bytes
 
-  # NEW: checagem de integridade opcional
   if ($Sha256) {
     $calc = (Get-Sha256Hex -Bytes $blob)
     if ($calc.ToLower() -ne $Sha256.ToLower()) {
@@ -242,47 +245,34 @@ try {
   }
 
   if (Is-Ps1 -Name $Entry -Bytes $blob) {
-    # Execução em memória (PowerShell)
     $code = Get-TextFromBytes -Bytes $blob
     $sb   = [ScriptBlock]::Create($code)
     & $sb @Args
     exit $LASTEXITCODE
   }
   elseif (Is-WindowsExe -Name $Entry -Bytes $blob) {
-    # NEW: executável nativo — arquivo temp com ACL estrita, Start-Process, remoção imediata.
     $tmpName = "memexec_{0}.exe" -f ([System.Guid]::NewGuid().ToString('N'))
     $tmpPath = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), $tmpName)
     [System.IO.File]::WriteAllBytes($tmpPath, $blob)
-
     try {
-      # ACL restritiva
       Set-StrictAcl -Path $tmpPath
-
       $psi = New-Object System.Diagnostics.ProcessStartInfo
       $psi.FileName = $tmpPath
       $psi.Arguments = ($Args -join ' ')
       $psi.UseShellExecute = $false
       $psi.CreateNoWindow = $HideWindow.IsPresent
       $psi.WindowStyle = if ($HideWindow) { [System.Diagnostics.ProcessWindowStyle]::Hidden } else { [System.Diagnostics.ProcessWindowStyle]::Normal }
-
       $proc = [System.Diagnostics.Process]::Start($psi)
-
-      # Remover a entrada de diretório **imediatamente** após iniciar
-      # (no NTFS, o arquivo fica sem nome até o processo liberar o handle)
       try { Remove-Item -LiteralPath $tmpPath -Force -ErrorAction SilentlyContinue } catch {}
-
       if ($NoWait) { exit 0 }
-
       $proc.WaitForExit()
       exit $proc.ExitCode
     }
     finally {
-      # redundância: caso o arquivo ainda exista (falha no delete), tentar remover
       try { if (Test-Path -LiteralPath $tmpPath) { Remove-Item -LiteralPath $tmpPath -Force -ErrorAction SilentlyContinue } } catch {}
     }
   }
   else {
-    # .bat/.cmd/.py/.sh etc. — temp + execução e remoção
     $ext = [System.IO.Path]::GetExtension($Entry)
     if (-not $ext) { $ext = '.bin' }
     $tmpPath = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), ("memexec_{0}{1}" -f ([System.Guid]::NewGuid().ToString('N')), $ext))
@@ -300,12 +290,8 @@ try {
       else {
         $p = Start-Process -FilePath $tmpPath -ArgumentList $Args -PassThru -WindowStyle ($(if ($HideWindow){'Hidden'} else {'Normal'}))
       }
-
-      # Remoção imediata (mesma lógica do EXE)
       try { Remove-Item -LiteralPath $tmpPath -Force -ErrorAction SilentlyContinue } catch {}
-
       if ($NoWait) { exit 0 }
-
       $p.WaitForExit()
       exit $p.ExitCode
     }
